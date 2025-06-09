@@ -14,10 +14,8 @@ BACKENDS = cycle([
 def proxy(path):
     backend = next(BACKENDS)
     url = f"{backend}/{path}"
-    # CHỖ SỬA: dùng .items() và bỏ dấu phẩy
     headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
 
-    # Forward
     resp = requests.request(
         method         = request.method,
         url            = url,
@@ -29,7 +27,6 @@ def proxy(path):
         allow_redirects= False,
     )
 
-    # Trả về cho client
     excluded = {'content-encoding','content-length','transfer-encoding','connection'}
     out_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
     return Response(resp.content, resp.status_code, out_headers)

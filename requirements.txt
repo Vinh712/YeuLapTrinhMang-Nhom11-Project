@@ -1,0 +1,8 @@
+flask==3.0.0
+pymongo==4.6.1
+requests==2.31.0
+pyperclip==1.8.2
+keyboard==0.13.5
+google-generativeai==0.3.2
+PyQt5==5.15.10
+python-dotenv==1.0.0
