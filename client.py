@@ -3,6 +3,7 @@ import time
 import requests
 import pyperclip
 import keyboard
+import json
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QSize
 from PyQt5.QtGui import QIcon, QCursor, QFont, QFontDatabase
 from PyQt5.QtWidgets import (
@@ -13,7 +14,91 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon, QMenu
 )
 
-API_BASE = "http://127.0.0.1:8000"
+# Import AES encryption for end-to-end communication
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+import base64
+import hashlib
+
+class AESCrypto:
+    def __init__(self, key=None):
+        if key is None:
+            self.key = get_random_bytes(32)
+        else:
+            if isinstance(key, str):
+                key = key.encode("utf-8")
+            if len(key) < 32:
+                key = key + b'0' * (32 - len(key))
+            elif len(key) > 32:
+                key = key[:32]
+            self.key = key
+    
+    def encrypt(self, data):
+        if isinstance(data, dict) or isinstance(data, list):
+            data = json.dumps(data, ensure_ascii=False)
+        
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        
+        iv = get_random_bytes(16)
+        cipher = AES.new(self.key, AES.MODE_CBC, iv)
+        
+        padded_data = pad(data, AES.block_size)
+        
+        encrypted_data = cipher.encrypt(padded_data)
+        
+        result = base64.b64encode(iv + encrypted_data).decode("utf-8")
+        return result
+    
+    def decrypt(self, encrypted_data):
+        try:
+            encrypted_bytes = base64.b64decode(encrypted_data.encode("utf-8"))
+            
+            iv = encrypted_bytes[:16]
+            encrypted_content = encrypted_bytes[16:]
+            
+            cipher = AES.new(self.key, AES.MODE_CBC, iv)
+            decrypted_padded = cipher.decrypt(encrypted_content)
+            
+            decrypted_data = unpad(decrypted_padded, AES.block_size)
+            
+            result = decrypted_data.decode("utf-8")
+            
+            try:
+                return json.loads(result)
+            except json.JSONDecodeError:
+                return result
+                
+        except Exception as e:
+            raise ValueError(f"Decryption failed: {str(e)}")
+
+# Shared AES encryption key for client-server communication
+SHARED_AES_KEY = "SuperFastLTM_2025_SecureKey_32B!"  # 32 bytes key
+
+def create_shared_crypto():
+    """
+    Tạo AES crypto instance với shared key cho client-server communication
+    """
+    # Tạo key 32 bytes từ shared secret
+    key = hashlib.sha256(SHARED_AES_KEY.encode('utf-8')).digest()
+    return AESCrypto(key)
+
+def encrypt_communication_data(data):
+    """
+    Mã hóa dữ liệu cho communication giữa client và server
+    """
+    crypto = create_shared_crypto()
+    return crypto.encrypt(data)
+
+def decrypt_communication_data(encrypted_data):
+    """
+    Giải mã dữ liệu từ communication giữa client và server
+    """
+    crypto = create_shared_crypto()
+    return crypto.decrypt(encrypted_data)
+
+API_BASE = "http://127.0.0.1:8000" # Changed to point to load balancer
 
 class Worker(QObject):
     finished = pyqtSignal(object)
@@ -164,27 +249,48 @@ class TranslationPopup(QWidget):
         
     def show_translation(self, data):
         self.is_translating = False
-        self.trans_text.setText(data.get('translated_text', ''))
-        
-        phonetic = data.get('phonetic')
-        self.phonetic.setText(phonetic if phonetic else '')
-        self.phonetic.setVisible(bool(phonetic))
-        
-        definitions = data.get('meanings', [])
-        if definitions:
-            def_text = '\n'.join(f"• {d['part_of_speech']}: {d['definition']}" for d in definitions)
-            self.definitions.setText(def_text)
-            self.definitions.setVisible(True)
-        else:
-            self.definitions.setVisible(False)
+        # Updated to handle both basic and advanced translation formats
+        if data.get("translation_type") == "basic":
+            self.trans_text.setText(data.get("translated_text", ""))
+            if data.get("word_translations"):
+                first_word_translation = data["word_translations"][0]["translation"]
+                self.phonetic.setText(first_word_translation.get("phonetic", ""))
+                self.phonetic.setVisible(bool(first_word_translation.get("phonetic")))
+                
+                definitions = first_word_translation.get("all_translations", [])
+                if definitions:
+                    def_text = '\n'.join(f"• {d["part_of_speech"]}: {d["translation"]}" for d in definitions)
+                    self.definitions.setText(def_text)
+                    self.definitions.setVisible(True)
+                else:
+                    self.definitions.setVisible(False)
+                self.alternatives.setVisible(False) # Basic translation doesn't have alternatives
+            else:
+                self.phonetic.setVisible(False)
+                self.definitions.setVisible(False)
+                self.alternatives.setVisible(False)
+        else: # Advanced translation
+            self.trans_text.setText(data.get("translated_text", ""))
             
-        alternatives = data.get('alternatives', [])
-        if alternatives:
-            alt_text = "Alternatives: " + ", ".join(alternatives)
-            self.alternatives.setText(alt_text)
-            self.alternatives.setVisible(True)
-        else:
-            self.alternatives.setVisible(False)
+            phonetic = data.get("phonetic")
+            self.phonetic.setText(phonetic if phonetic else "")
+            self.phonetic.setVisible(bool(phonetic))
+            
+            definitions = data.get("meanings", [])
+            if definitions:
+                def_text = '\n'.join(f"• {d["part_of_speech"]}: {d["definition"]}" for d in definitions)
+                self.definitions.setText(def_text)
+                self.definitions.setVisible(True)
+            else:
+                self.definitions.setVisible(False)
+                
+            alternatives = data.get("alternatives", [])
+            if alternatives:
+                alt_text = "Alternatives: " + ", ".join(alternatives)
+                self.alternatives.setText(alt_text)
+                self.alternatives.setVisible(True)
+            else:
+                self.alternatives.setVisible(False)
             
         self.show()
 
@@ -232,8 +338,8 @@ class HotkeyListener(QThread):
             pass
             
         while True:
-            keyboard.wait('ctrl+b')
-            keyboard.press_and_release('ctrl+c')
+            keyboard.wait("ctrl+b")
+            keyboard.press_and_release("ctrl+c")
             time.sleep(0.05)
             try:
                 txt = pyperclip.paste()
@@ -259,7 +365,7 @@ class ClientUI(QMainWindow):
         self.tray_icon = QSystemTrayIcon(self)
         icon = QIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
         self.tray_icon.setIcon(icon)
-        self.tray_icon.setToolTip('SuperFastLTM Client')
+        self.tray_icon.setToolTip("SuperFastLTM Client")
         
         tray_menu = QMenu()
         show_action = tray_menu.addAction("Show")
@@ -508,449 +614,590 @@ class ClientUI(QMainWindow):
         title.setObjectName("welcomeTitle")
         title.setAlignment(Qt.AlignCenter)
 
-        font = QFont("Roboto", 12)
-        self.login_user = QLineEdit()
-        self.login_user.setPlaceholderText("Username")
-        self.login_user.setFixedWidth(300)
-        self.login_user.setMinimumHeight(40)
-        self.login_user.setFont(font)
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Username")
+        self.username_input.setFixedSize(300, 40)
 
-        self.login_pass = QLineEdit()
-        self.login_pass.setPlaceholderText("Password")
-        self.login_pass.setEchoMode(QLineEdit.Password)
-        self.login_pass.setFixedWidth(300)
-        self.login_pass.setMinimumHeight(40)
-        self.login_pass.setFont(font)
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Password")
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setFixedSize(300, 40)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(10)
+        login_button = QPushButton("Login")
+        login_button.setFixedSize(300, 40)
+        login_button.clicked.connect(self.login)
 
-        login_btn = QPushButton("Login")
-        login_btn.setMinimumHeight(40)
-        login_btn.setFixedWidth(145)
-        login_btn.clicked.connect(self.do_login)
-
-        register_btn = QPushButton("Register")
-        register_btn.setMinimumHeight(40)
-        register_btn.setFixedWidth(145)
-        register_btn.clicked.connect(self.do_register)
-
-        btn_layout.addWidget(login_btn)
-        btn_layout.addWidget(register_btn)
+        register_button = QPushButton("Register")
+        register_button.setFixedSize(300, 40)
+        register_button.clicked.connect(self.register)
 
         layout.addWidget(title)
-        layout.addWidget(self.login_user, alignment=Qt.AlignCenter)
-        layout.addWidget(self.login_pass, alignment=Qt.AlignCenter)
-        layout.addLayout(btn_layout)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.addWidget(self.username_input)
+        layout.addWidget(self.password_input)
+        layout.addWidget(login_button)
+        layout.addWidget(register_button)
 
         return widget
 
     def _create_main_widget(self):
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        self.tabs = QTabWidget()
-        
-        style = self.style()
-        self.tabs.addTab(self._create_translate_tab(), QIcon(style.standardIcon(QStyle.SP_TitleBarContextHelpButton)), "Translate")
-        self.tabs.addTab(self._create_quiz_tab(), QIcon(style.standardIcon(QStyle.SP_DialogApplyButton)), "Quiz")
-        self.tabs.addTab(self._create_history_tab(), QIcon(style.standardIcon(QStyle.SP_DialogYesButton)), "History")
-        self.tabs.addTab(self._create_notes_tab(), QIcon(style.standardIcon(QStyle.SP_FileIcon)), "Notes")
-        
-        layout.addWidget(self.tabs)
-        widget.setLayout(layout)
+        main_layout = QVBoxLayout(widget)
+
+        self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(self._create_translate_tab(), "Translate")
+        self.tab_widget.addTab(self._create_quiz_tab(), "Quiz")
+        self.tab_widget.addTab(self._create_history_tab(), "History")
+        self.tab_widget.addTab(self._create_note_tab(), "Notes")
+        self.tab_widget.addTab(self._create_ranking_tab(), "Ranking")
+
+        main_layout.addWidget(self.tab_widget)
+
         return widget
 
     def _create_translate_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        
-        content_panel = QWidget()
-        content_layout = QHBoxLayout(content_panel)
-        content_panel.setObjectName("translationPanel")
-        
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_panel.setObjectName("translationSidePanel")
-        
-        input_header = QHBoxLayout()
-        from_label = QLabel("From:")
-        from_label.setObjectName("translationLabel")
-        self.from_combo = QComboBox()
-        self.from_combo.addItems(["auto", "en", "vi", "fr", "es"])
-        self.from_combo.setObjectName("translationCombo")
-        
-        input_header.addWidget(from_label)
-        input_header.addWidget(self.from_combo)
-        input_header.addStretch()
-        
+
+        # Input section
+        input_group = QFrame()
+        input_group.setFrameShape(QFrame.StyledPanel)
+        input_layout = QVBoxLayout(input_group)
+        input_layout.addWidget(QLabel("Text to Translate:"))
         self.translate_input = QTextEdit()
-        self.translate_input.setObjectName("translationInput")
-        self.translate_input.setPlaceholderText("Enter text to translate...")
-        
-        left_layout.addLayout(input_header)
-        left_layout.addWidget(self.translate_input)
-        
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_panel.setObjectName("translationSidePanel")
-        
-        output_header = QHBoxLayout()
-        to_label = QLabel("To:")
-        to_label.setObjectName("translationLabel")
-        self.to_combo = QComboBox()
-        self.to_combo.addItems(["vi", "en", "fr", "es"])
-        self.to_combo.setObjectName("translationCombo")
-        
-        output_header.addWidget(to_label)
-        output_header.addWidget(self.to_combo)
-        output_header.addStretch()
-        
+        self.translate_input.setPlaceholderText("Enter text here...")
+        input_layout.addWidget(self.translate_input)
+
+        # Translation type selection
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(QLabel("Translation Type:"))
+        self.basic_radio = QRadioButton("Basic (Local Dictionary)")
+        self.basic_radio.setChecked(True)
+        self.advanced_radio = QRadioButton("Advanced (Gemini AI)")
+        type_layout.addWidget(self.basic_radio)
+        type_layout.addWidget(self.advanced_radio)
+        type_layout.addStretch(1)
+        input_layout.addLayout(type_layout)
+
+        translate_button = QPushButton("Translate")
+        translate_button.clicked.connect(self.translate_text)
+        input_layout.addWidget(translate_button)
+
+        layout.addWidget(input_group)
+
+        # Output section
+        output_group = QFrame()
+        output_group.setFrameShape(QFrame.StyledPanel)
+        output_layout = QVBoxLayout(output_group)
+        output_layout.addWidget(QLabel("Translation Result:"))
         self.translate_output = QTextEdit()
-        self.translate_output.setObjectName("translationOutput")
         self.translate_output.setReadOnly(True)
-        
-        self.phonetic_output = QLabel()
-        self.phonetic_output.setObjectName("phoneticOutput")
-        self.definitions_output = QLabel()
-        self.definitions_output.setObjectName("definitionsOutput")
-        self.alternatives_output = QLabel()
-        self.alternatives_output.setObjectName("alternativesOutput")
-        
-        right_layout.addLayout(output_header)
-        right_layout.addWidget(self.translate_output)
-        right_layout.addWidget(self.phonetic_output)
-        right_layout.addWidget(self.definitions_output)
-        right_layout.addWidget(self.alternatives_output)
-        
-        content_layout.addWidget(left_panel)
-        content_layout.addWidget(right_panel)
-        
-        layout.addWidget(content_panel)
-        
-        btn_trans = QPushButton("Translate")
-        btn_trans.setObjectName("translationButton")
-        btn_trans.clicked.connect(self.do_translate)
-        layout.addWidget(btn_trans)
-        
+        output_layout.addWidget(self.translate_output)
+
+        layout.addWidget(output_group)
+        layout.addStretch(1)
         return tab
-    
-    def on_translate_success(self, response_data):
-        self.translate_output.clear()
-        self.phonetic_output.clear()
-        self.definitions_output.clear()
-        self.alternatives_output.clear()
-
-        translated_data_from_server = response_data.get('translated_text', {}) 
-        
-        translation = translated_data_from_server.get('translated_text', '')
-        phonetic = translated_data_from_server.get('phonetic', '')
-        meanings = translated_data_from_server.get('meanings', [])
-        alternatives = translated_data_from_server.get('alternatives', [])
-        
-        self.translate_output.setText(translation)
-        self.phonetic_output.setText(f"IPA: {phonetic}" if phonetic else "")
-
-        if meanings:
-            meanings_text = '\n'.join(f"• {m['part_of_speech']}: {m['definition']}" for m in meanings)
-            self.definitions_output.setText(meanings_text)
-        else:
-            self.definitions_output.setText("")
-
-        if alternatives:
-            alternatives_text = "Alternatives: " + ", ".join(alternatives)
-            self.alternatives_output.setText(alternatives_text)
-        else:
-            self.alternatives_output.setText("")
 
     def _create_quiz_tab(self):
         tab = QWidget()
-        self._configure_widget_focus(tab)
         layout = QVBoxLayout(tab)
-        
-        top_layout = QHBoxLayout()
-        top_layout.addWidget(QLabel("Difficulty Level:"))
-        self.quiz_level_combo = QComboBox(); self.quiz_level_combo.addItems(["A1", "A2", "B1", "B2", "C1", "C2"])
-        top_layout.addWidget(self.quiz_level_combo)
-        btn_quiz = QPushButton("Generate New Quiz"); btn_quiz.clicked.connect(self.generate_quiz)
-        top_layout.addWidget(btn_quiz)
-        layout.addLayout(top_layout)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
+        # Difficulty selection
+        difficulty_layout = QHBoxLayout()
+        difficulty_layout.addWidget(QLabel("Difficulty:"))
+        self.difficulty_combo = QComboBox()
+        self.difficulty_combo.addItems(["A1", "A2", "B1", "B2", "C1", "C2"])
+        difficulty_layout.addWidget(self.difficulty_combo)
+        difficulty_layout.addStretch(1)
+        layout.addLayout(difficulty_layout)
+
+        generate_quiz_button = QPushButton("Generate Quiz")
+        generate_quiz_button.clicked.connect(self.generate_quiz)
+        layout.addWidget(generate_quiz_button)
+
+        self.quiz_area = QScrollArea()
+        self.quiz_area.setWidgetResizable(True)
         self.quiz_content_widget = QWidget()
-        self.quiz_questions_layout = QVBoxLayout(self.quiz_content_widget)
-        self.quiz_questions_layout.setAlignment(Qt.AlignTop)
-        scroll_area.setWidget(self.quiz_content_widget)
+        self.quiz_content_layout = QVBoxLayout(self.quiz_content_widget)
+        self.quiz_area.setWidget(self.quiz_content_widget)
+        layout.addWidget(self.quiz_area)
 
-        layout.addWidget(scroll_area)
+        self.submit_quiz_button = QPushButton("Submit Quiz")
+        self.submit_quiz_button.clicked.connect(self.submit_quiz)
+        self.submit_quiz_button.hide() # Hide until quiz is generated
+        layout.addWidget(self.submit_quiz_button)
+
+        self.quiz_result_button = QPushButton("View Quiz Result")
+        self.quiz_result_button.clicked.connect(self.show_quiz_result)
+        self.quiz_result_button.hide() # Hide until quiz is submitted
+        layout.addWidget(self.quiz_result_button)
+
         return tab
 
     def _create_history_tab(self):
         tab = QWidget()
-        self._configure_widget_focus(tab)
         layout = QVBoxLayout(tab)
+
+        refresh_button = QPushButton("Refresh History")
+        refresh_button.clicked.connect(self.load_history)
+        layout.addWidget(refresh_button)
+
         self.history_table = QTableWidget()
-        self.history_table.setColumnCount(4)
-        self.history_table.setHorizontalHeaderLabels(["Time", "Type", "Input", "Output"])
+        self.history_table.setColumnCount(3)
+        self.history_table.setHorizontalHeaderLabels(["Date", "Type", "Content"]) # Updated columns
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        btn_load_history = QPushButton("Reload History"); btn_load_history.clicked.connect(self.load_history)
-        layout.addWidget(btn_load_history)
         layout.addWidget(self.history_table)
+
         return tab
 
-    def _create_notes_tab(self):
+    def _create_note_tab(self):
         tab = QWidget()
-        self._configure_widget_focus(tab)
         layout = QVBoxLayout(tab)
-        self.note_table = QTableWidget()
-        self.note_table.setColumnCount(2)
-        self.note_table.setHorizontalHeaderLabels(["Date", "Content"])
-        self.note_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.note_input = QLineEdit(); self.note_input.setPlaceholderText("Enter a new note...")
-        btn_save_note = QPushButton("Save Note"); btn_save_note.clicked.connect(self.save_note)
-        btn_load_notes = QPushButton("Reload Notes"); btn_load_notes.clicked.connect(self.load_notes)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.addWidget(btn_load_notes)
-        btn_layout.addWidget(btn_save_note)
-        
-        layout.addLayout(btn_layout)
-        layout.addWidget(self.note_table)
-        layout.addWidget(self.note_input)
+
+        note_input_layout = QHBoxLayout()
+        self.note_input = QLineEdit()
+        self.note_input.setPlaceholderText("Enter your note here...")
+        note_input_layout.addWidget(self.note_input)
+
+        save_note_button = QPushButton("Save Note")
+        save_note_button.clicked.connect(self.save_note)
+        note_input_layout.addWidget(save_note_button)
+        layout.addLayout(note_input_layout)
+
+        refresh_notes_button = QPushButton("Refresh Notes")
+        refresh_notes_button.clicked.connect(self.load_notes)
+        layout.addWidget(refresh_notes_button)
+
+        self.notes_table = QTableWidget()
+        self.notes_table.setColumnCount(2)
+        self.notes_table.setHorizontalHeaderLabels(["Date", "Note"]) # Updated columns
+        self.notes_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.notes_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.notes_table)
+
         return tab
 
-    def _execute_network_task(self, task_key, func, *args, **kwargs):
-        worker = Worker(func, *args, **kwargs)
+    def _create_ranking_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        refresh_ranking_button = QPushButton("Refresh Ranking")
+        refresh_ranking_button.clicked.connect(self.load_ranking)
+        layout.addWidget(refresh_ranking_button)
+
+        self.ranking_table = QTableWidget()
+        self.ranking_table.setColumnCount(3)
+        self.ranking_table.setHorizontalHeaderLabels(["Rank", "Username", "Points"])
+        self.ranking_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ranking_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.ranking_table)
+
+        self.ranking_stats_label = QLabel("")
+        layout.addWidget(self.ranking_stats_label)
+
+        return tab
+
+    def show_message(self, title, message, icon=QMessageBox.Information):
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(icon)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(message)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.exec_()
+
+    def run_in_thread(self, func, callback, error_callback=None, *args, **kwargs):
         thread = QThread()
+        worker = Worker(func, *args, **kwargs)
         worker.moveToThread(thread)
         
-        worker.error.connect(lambda e: self._on_task_error(task_key, e))
+        # Store references to prevent premature garbage collection
+        # Use a unique ID for each thread/worker pair
+        thread_id = id(thread)
+        self.threadpool[thread_id] = {
+            'thread': thread,
+            'worker': worker
+        }
+
         thread.started.connect(worker.run)
+        worker.finished.connect(callback)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        
+        # Clean up references when thread finishes
+        thread.finished.connect(lambda: self.threadpool.pop(thread_id, None))
         thread.finished.connect(thread.deleteLater)
+        
+        if error_callback:
+            worker.error.connect(error_callback)
+        thread.start()
+        return thread
 
-        self.threadpool[task_key] = (thread, worker)
-        return thread, worker
-
-    def _on_task_error(self, task_key, error_msg):
-        QMessageBox.critical(self, f"Error in {task_key}", error_msg)
-        if task_key == "popup_translate":
-            self.translation_popup.show_at_cursor("Translation Error")
+    def encrypted_api_call(self, endpoint, method='POST', data=None):
+        """
+        Thực hiện API call với mã hóa AES đầu cuối
+        """
+        try:
+            # Mã hóa dữ liệu trước khi gửi
+            if data:
+                encrypted_data = encrypt_communication_data(data)
+                payload = {"encrypted_data": encrypted_data}
+            else:
+                payload = None
             
-    def do_login(self):
-        payload = {"username": self.login_user.text(), "password": self.login_pass.text()}
-        thread, worker = self._execute_network_task("login", requests.post, f"{API_BASE}/login", json=payload)
-        worker.finished.connect(self.on_login_success)
-        thread.start()
-
-    def on_login_success(self, r):
-        if r.status_code == 200:
-            self.token = r.json().get('token')
-            self.stack.setCurrentWidget(self.main_widget)
-            self.load_history()
-            self.load_notes()
-        else:
-            QMessageBox.warning(self, "Login Failed", r.json().get("error", "Unknown error"))
-    
-    def do_register(self):
-        payload = {"username": self.login_user.text(), "password": self.login_pass.text()}
-        thread, worker = self._execute_network_task("register", requests.post, f"{API_BASE}/register", json=payload)
-        worker.finished.connect(self.on_register_success)
-        thread.start()
-
-    def on_register_success(self, r):
-        if r.status_code == 201:
-            QMessageBox.information(self, "Success", "Registration successful! Please login.")
-        else:
-            QMessageBox.warning(self, "Registration Failed", r.json().get("error", "Unknown error"))
-
-    def do_translate(self):
-        payload = {
-            "token": self.token,
-            "text": self.translate_input.toPlainText(),
-            "from_lang": self.from_combo.currentText(),
-            "to_lang": self.to_combo.currentText()
-        }
-        thread, worker = self._execute_network_task("translate", requests.post, f"{API_BASE}/translate", json=payload)
-        worker.finished.connect(lambda r: self.on_translate_success(r.json()))
-        thread.start()
-
-    def generate_quiz(self):
-        while self.quiz_questions_layout.count():
-            item = self.quiz_questions_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        self.quiz_answers.clear()
-        self.quiz_button_groups.clear()
-
-        payload = {"token": self.token, "difficulty": self.quiz_level_combo.currentText()}
-        thread, worker = self._execute_network_task("quiz", requests.post, f"{API_BASE}/generate_quiz", json=payload)
-        worker.finished.connect(self.on_quiz_generated)
-        thread.start()
-
-    def on_quiz_generated(self, r):
-        if r.status_code == 200:
-            self.display_quiz(r.json().get('questions', []))
-        else:
-            QMessageBox.warning(self, "API Error", r.json().get("error", "Failed to generate quiz"))
-
-    def display_quiz(self, questions):
-        for i, q_data in enumerate(questions):
-            q_label = QLabel(f"<b>{i+1}. {q_data['question']}</b>"); q_label.setWordWrap(True)
-            self.quiz_questions_layout.addWidget(q_label)
+            # Gửi request
+            if method == 'POST':
+                if payload:
+                    response = requests.post(f"{API_BASE}{endpoint}", json=payload)
+                else:
+                    response = requests.post(f"{API_BASE}{endpoint}")
+            elif method == 'GET':
+                response = requests.get(f"{API_BASE}{endpoint}")
+            else:
+                raise ValueError(f"Unsupported method: {method}")
             
-            self.quiz_answers[i] = q_data['answer']
-            button_group = QButtonGroup(self)
-            self.quiz_button_groups.append(button_group)
-
-            for option_text in q_data['options']:
-                radio_btn = QRadioButton(option_text)
-                button_group.addButton(radio_btn)
-                self.quiz_questions_layout.addWidget(radio_btn)
-
-        submit_btn = QPushButton("Submit Answers")
-        submit_btn.clicked.connect(self.check_quiz_answers)
-        self.quiz_questions_layout.addWidget(submit_btn)
-
-    def check_quiz_answers(self):
-        for i, group in enumerate(self.quiz_button_groups):
-            selected_btn = group.checkedButton()
-            correct_answer = self.quiz_answers[i]
+            response.raise_for_status()
             
-            for button in group.buttons():
-                if button.text() == correct_answer:
-                    button.setStyleSheet("""
-                        QRadioButton {
-                            color: #98C379;
-                            font-weight: bold;
-                        }
-                        QRadioButton::indicator:checked {
-                            background-color: #98C379;
-                            border: 2px solid #98C379;
-                        }
-                    """)
-                elif button == selected_btn and button.text() != correct_answer:
-                    button.setStyleSheet("""
-                        QRadioButton {
-                            color: #E06C75;
-                            font-weight: bold;
-                        }
-                        QRadioButton::indicator:checked {
-                            background-color: #E06C75;
-                            border: 2px solid #E06C75;
-                        }
-                    """)
+            # Xử lý response
+            response_data = response.json()
+            
+            # Kiểm tra xem response có được mã hóa không
+            if isinstance(response_data, dict) and 'encrypted_data' in response_data:
+                # Giải mã response
+                decrypted_response = decrypt_communication_data(response_data['encrypted_data'])
+                return decrypted_response
+            else:
+                # Response không được mã hóa (backward compatibility)
+                return response_data
                 
-    def load_history(self):
-        payload = {"token": self.token}
-        thread, worker = self._execute_network_task("history", requests.post, f"{API_BASE}/view_history", json=payload)
-        worker.finished.connect(self.on_history_loaded)
-        thread.start()
-    
-    def on_history_loaded(self, r):
-        data = r.json()
-        self.history_table.setRowCount(0)
-        for item in data.get('history', []):
-            if isinstance(item, dict):
-                row = self.history_table.rowCount()
-                self.history_table.insertRow(row)
-                self.history_table.setItem(row, 0, QTableWidgetItem(str(item.get('timestamp', ''))))
-                self.history_table.setItem(row, 1, QTableWidgetItem(str(item.get('type', ''))))
-                self.history_table.setItem(row, 2, QTableWidgetItem(str(item.get('input', ''))))
-                self.history_table.setItem(row, 3, QTableWidgetItem(str(item.get('output', ''))))
+        except Exception as e:
+            raise Exception(f"API call failed: {str(e)}")
 
-    def save_note(self):
-        payload = {"token": self.token, "content": self.note_input.text()}
-        thread, worker = self._execute_network_task("save_note", requests.post, f"{API_BASE}/save_note", json=payload)
-        worker.finished.connect(lambda r: self.load_notes() if r.status_code == 200 else None)
-        thread.start()
-        self.note_input.clear()
+    def login(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+        self.run_in_thread(self._login_request, self._login_callback, None, username, password)
 
-    def load_notes(self):
-        payload = {"token": self.token}
-        thread, worker = self._execute_network_task("load_notes", requests.post, f"{API_BASE}/view_note", json=payload)
-        worker.finished.connect(self.on_notes_loaded)
-        thread.start()
+    def _login_request(self, username, password):
+        return self.encrypted_api_call('/login', 'POST', {"username": username, "password": password})
 
-    def on_notes_loaded(self, r):
-        data = r.json()
-        dates = data.get("created_day", [])
-        content = data.get("content", [])
-        self.note_table.setRowCount(0)
-        for d, c in zip(dates, content):
-            row = self.note_table.rowCount()
-            self.note_table.insertRow(row)
-            self.note_table.setItem(row, 0, QTableWidgetItem(d))
-            self.note_table.setItem(row, 1, QTableWidgetItem(c))
+    def _login_callback(self, data):
+        if "token" in data:
+            self.token = data["token"]
+            self.stack.setCurrentWidget(self.main_widget)
+            self.show_message("Login Success", "Logged in successfully!")
+            self.load_history() # Load history after login
+            self.load_notes() # Load notes after login
+            self.load_ranking() # Load ranking after login
+        else:
+            self.show_message("Login Failed", data.get("error", "Unknown error"), QMessageBox.Warning)
 
-    def on_hotkey_translate(self, txt):
-        if not txt:
-            self.translation_popup.show_at_cursor("Please select text to translate.")
+    def register(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+        self.run_in_thread(self._register_request, self._register_callback, None, username, password)
+
+    def _register_request(self, username, password):
+        return self.encrypted_api_call('/register', 'POST', {"username": username, "password": password})
+
+    def _register_callback(self, data):
+        if "message" in data:
+            self.show_message("Registration Success", data["message"])
+        else:
+            self.show_message("Registration Failed", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def translate_text(self):
+        text = self.translate_input.toPlainText()
+        if not text:
+            self.show_message("Error", "Please enter text to translate.", QMessageBox.Warning)
             return
         
-        # Kiểm tra nếu đang trong quá trình dịch
-        if self.translation_popup.is_translating:
-            self.translation_popup.show_at_cursor("Please wait for current translation to complete.")
-            return
-                
-        self.translation_popup.show_loading()
-        payload = {
-            "text": txt,
-            "from_lang": "auto", 
-            "to_lang": "vi"
-        }
-
-        thread, worker = self._execute_network_task(
-            "popup_translate", 
-            requests.post, 
-            f"{API_BASE}/translate_without_auth", 
-            json=payload
-        )
-        worker.finished.connect(self.on_popup_translate_finished)
-        thread.start()
-
-    def on_popup_translate_finished(self, r):
-        if r.status_code == 200:
-            response_data = r.json().get('translated_text', {})
-            self.translation_popup.show_at_cursor(response_data)
+        if self.basic_radio.isChecked():
+            self.run_in_thread(self._translate_basic_request, self._translate_callback, None, text)
         else:
-            self.translation_popup.show_at_cursor(f"Error: {r.json().get('error', 'Unknown')}")
-        self.translation_popup.is_translating = False
+            self.run_in_thread(self._translate_advanced_request, self._translate_callback, None, text)
 
-    def closeEvent(self, event):
-        if self.tray_icon.isVisible():
-            self.hide()
-            self.tray_icon.showMessage(
-                "SuperFastLTM Client",
-                "Application was minimized to tray",
-                QSystemTrayIcon.Information,
-                2000
-            )
-            event.ignore()
+    def _translate_basic_request(self, text):
+        return self.encrypted_api_call('/translate_basic', 'POST', {
+            "token": self.token,
+            "text": text
+        })
 
-    def quit_application(self):
-        self.tray_icon.hide()
-        QApplication.quit()
+    def _translate_advanced_request(self, text):
+        return self.encrypted_api_call('/translate_advanced', 'POST', {
+            "token": self.token,
+            "text": text,
+            "from_lang": "en", # Assuming English input for now
+            "to_lang": "vi"
+        })
+
+    def _translate_callback(self, data):
+        if "translated_data" in data:
+            # Handle both basic and advanced translation formats
+            translated_data = data["translated_data"]
+            if translated_data.get("translation_type") == "basic":
+                self.translate_output.setText(translated_data.get("translated_text", ""))
+            else:
+                self.translate_output.setText(translated_data.get("translated_text", ""))
+            self.load_history() # Refresh history after translation
+        else:
+            self.show_message("Translation Error", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def on_hotkey_translate(self, text):
+        if not text:
+            return
+        if not self.token:
+            self.tray_icon.showMessage("SuperFastLTM", "Please login to use translation feature.", QSystemTrayIcon.Warning)
+            return
+        
+        self.translation_popup.show_loading()
+        self.run_in_thread(self._translate_advanced_request, self._hotkey_translate_callback, self._hotkey_translate_error, text)
+
+    def _hotkey_translate_callback(self, data):
+        if "translated_data" in data:
+            self.translation_popup.show_translation(data["translated_data"])
+            self.load_history() # Refresh history after hotkey translation
+        else:
+            self.translation_popup.show_at_cursor(data.get("error", "Translation Error"))
+
+    def _hotkey_translate_error(self, error_msg):
+        self.translation_popup.show_at_cursor(f"Error: {error_msg}")
+
+    def generate_quiz(self):
+        if not self.token:
+            self.show_message("Error", "Please login to generate quiz.", QMessageBox.Warning)
+            return
+        difficulty = self.difficulty_combo.currentText()
+        self.run_in_thread(self._generate_quiz_request, self._generate_quiz_callback, None, difficulty)
+
+    def _generate_quiz_request(self, difficulty):
+        return self.encrypted_api_call('/generate_quiz', 'POST', {
+            "token": self.token,
+            "difficulty": difficulty
+        })
+
+    def _generate_quiz_callback(self, data):
+        if "questions" in data:
+            self.current_quiz_data = data # Store quiz data for submission
+            self.quiz_answers = {}
+            self.quiz_button_groups = []
+            
+            # Clear previous quiz
+            for i in reversed(range(self.quiz_content_layout.count())):
+                widget = self.quiz_content_layout.itemAt(i).widget()
+                if widget:
+                    widget.setParent(None)
+            
+            for i, question_data in enumerate(data["questions"]):
+                question_label = QLabel(f"Question {i+1}: {question_data['question']}")
+                self.quiz_content_layout.addWidget(question_label)
+                
+                button_group = QButtonGroup(self)
+                self.quiz_button_groups.append(button_group)
+                
+                for option_idx, option_text in enumerate(question_data["options"]):
+                    radio_button = QRadioButton(option_text)
+                    radio_button.answer_index = option_idx # Store index for easy lookup
+                    button_group.addButton(radio_button, option_idx)
+                    self.quiz_content_layout.addWidget(radio_button)
+            
+            self.submit_quiz_button.show()
+            self.quiz_result_button.hide() # Hide result button until submitted
+        else:
+            self.show_message("Quiz Generation Error", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def submit_quiz(self):
+        if not self.token:
+            self.show_message("Error", "Please login to submit quiz.", QMessageBox.Warning)
+            return
+        
+        if not hasattr(self, "current_quiz_data") or not self.current_quiz_data:
+            self.show_message("Error", "No quiz generated yet.", QMessageBox.Warning)
+            return
+        
+        user_answers = {}
+        for i, button_group in enumerate(self.quiz_button_groups):
+            checked_button = button_group.checkedButton()
+            if checked_button:
+                user_answers[str(i)] = checked_button.text() # Store the text of the selected option
+            else:
+                user_answers[str(i)] = "" # No answer selected
+        
+        difficulty = self.difficulty_combo.currentText()
+        self.run_in_thread(self._submit_quiz_request, self._submit_quiz_callback, None, self.current_quiz_data, user_answers, difficulty)
+
+    def _submit_quiz_request(self, quiz_data, user_answers, difficulty):
+        return self.encrypted_api_call('/submit_quiz', 'POST', {
+            "token": self.token,
+            "quiz_data": quiz_data,
+            "user_answers": user_answers,
+            "difficulty": difficulty
+        })
+
+    def _submit_quiz_callback(self, data):
+        if "result" in data:
+            self.last_quiz_result = data["result"] # Store result for viewing
+            self.show_message("Quiz Submitted", data["message"])
+            self.submit_quiz_button.hide()
+            self.quiz_result_button.show()
+            self.load_ranking() # Refresh ranking after quiz submission
+            self.load_history() # Refresh history after quiz submission
+        else:
+            self.show_message("Quiz Submission Error", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def show_quiz_result(self):
+        if not hasattr(self, "last_quiz_result") or not self.last_quiz_result:
+            self.show_message("Error", "No quiz result to display.", QMessageBox.Warning)
+            return
+        
+        result = self.last_quiz_result
+        result_message = f"Score: {result['score']} points\n"
+        result_message += f"Correct: {result['correct_count']}/{result['total_questions']}\n"
+        result_message += f"Percentage: {result['percentage']:.2f}%\n\n"
+        
+        result_message += "Correct Answers:\n"
+        for ans in result["correct_answers"]:
+            result_message += f"- Q: {ans['question']}\n  Your Answer: {ans['user_answer']}\n  Correct: {ans['correct_answer']}\n\n"
+            
+        result_message += "Incorrect Answers:\n"
+        for ans in result["incorrect_answers"]:
+            result_message += f"- Q: {ans['question']}\n  Your Answer: {ans['user_answer']}\n  Correct: {ans['correct_answer']}\n\n"
+            
+        self.show_message("Quiz Result", result_message)
+
+    def load_history(self):
+        if not self.token:
+            return
+        self.run_in_thread(self._load_history_request, self._load_history_callback)
+
+    def _load_history_request(self):
+        return self.encrypted_api_call('/view_history', 'POST', {
+            "token": self.token
+        })
+
+    def _load_history_callback(self, data):
+        if "history" in data:
+            self.history_table.setRowCount(0)
+            for row, entry in enumerate(data["history"]):
+                self.history_table.insertRow(row)
+                content_data = entry["content"]
+                
+                # Try to parse content_data if it's a string (decrypted JSON)
+                if isinstance(content_data, str):
+                    try:
+                        content_data = json.loads(content_data)
+                    except json.JSONDecodeError:
+                        pass # Keep as string if not JSON
+
+                history_type = content_data.get("type", "N/A")
+                history_input = content_data.get("input", "N/A")
+                history_output = content_data.get("output", "N/A")
+
+                display_content = ""
+                if history_type == "translate_basic" or history_type == "translate_advanced":
+                    display_content = f"Input: {history_input}\nOutput: {history_output.get('translated_text', 'N/A')}"
+                elif history_type == "generate_quiz":
+                    display_content = f"Difficulty: {content_data.get('difficulty', 'N/A')}\nQuestions: {len(content_data.get('quiz_data', {}).get('questions', []))}"
+                elif history_type == "submit_quiz":
+                    display_content = f"Difficulty: {content_data.get('difficulty', 'N/A')}\nScore: {content_data.get('result', {}).get('score', 'N/A')}"
+                else:
+                    display_content = str(content_data)
+
+                self.history_table.setItem(row, 0, QTableWidgetItem(entry["created_day"]))
+                self.history_table.setItem(row, 1, QTableWidgetItem(history_type))
+                self.history_table.setItem(row, 2, QTableWidgetItem(display_content))
+            self.history_table.resizeRowsToContents()
+        else:
+            self.show_message("History Error", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def save_note(self):
+        if not self.token:
+            self.show_message("Error", "Please login to save notes.", QMessageBox.Warning)
+            return
+        content = self.note_input.text()
+        if not content:
+            self.show_message("Error", "Note content cannot be empty.", QMessageBox.Warning)
+            return
+        self.run_in_thread(self._save_note_request, self._save_note_callback, None, content)
+
+    def _save_note_request(self, content):
+        return self.encrypted_api_call('/save_note', 'POST', {
+            "token": self.token,
+            "content": content
+        })
+
+    def _save_note_callback(self, data):
+        if "message" in data:
+            self.show_message("Note Saved", data["message"])
+            self.note_input.clear()
+            self.load_notes() # Refresh notes after saving
+        else:
+            self.show_message("Save Note Error", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def load_notes(self):
+        if not self.token:
+            return
+        self.run_in_thread(self._load_notes_request, self._load_notes_callback)
+
+    def _load_notes_request(self):
+        return self.encrypted_api_call('/view_note', 'POST', {
+            "token": self.token
+        })
+
+    def _load_notes_callback(self, data):
+        if "notes" in data:
+            self.notes_table.setRowCount(0)
+            for row, entry in enumerate(data["notes"]):
+                self.notes_table.insertRow(row)
+                self.notes_table.setItem(row, 0, QTableWidgetItem(entry["created_day"]))
+                self.notes_table.setItem(row, 1, QTableWidgetItem(entry["content"]))
+            self.notes_table.resizeRowsToContents()
+        else:
+            self.show_message("Notes Error", data.get("error", "Unknown error"), QMessageBox.Warning)
+
+    def load_ranking(self):
+        self.run_in_thread(self._load_ranking_request, self._load_ranking_callback)
+
+    def _load_ranking_request(self):
+        return self.encrypted_api_call('/get_ranking', 'GET')
+
+    def _load_ranking_callback(self, data):
+        if "top_users" in data:
+            self.ranking_table.setRowCount(0)
+            for row, user in enumerate(data["top_users"]):
+                self.ranking_table.insertRow(row)
+                self.ranking_table.setItem(row, 0, QTableWidgetItem(str(user["rank"])))
+                self.ranking_table.setItem(row, 1, QTableWidgetItem(user["username"]))
+                self.ranking_table.setItem(row, 2, QTableWidgetItem(str(user["point"])))
+            
+            stats = data.get("stats", {})
+            stats_text = f"Total Users: {stats.get('total_users', 0)}\n"
+            if stats.get("top_user"):
+                stats_text += f"Top User: {stats['top_user']['username']} ({stats['top_user']['point']} points)\n"
+            stats_text += f"Average Points: {stats.get('average_points', 0):.2f}"
+            self.ranking_stats_label.setText(stats_text)
+        else:
+            self.show_message("Ranking Error", data.get("error", "Unknown error"), QMessageBox.Warning)
 
     def tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show()
-            self.activateWindow()
+        if reason == QSystemTrayIcon.Trigger:
+            if self.isHidden():
+                self.show()
+            else:
+                self.hide()
+
+    def quit_application(self):
+        self.hotkey_thread.quit()
+        self.hotkey_thread.wait()
+        QApplication.quit()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # Load custom font
+    QFontDatabase.addApplicationFont("Roboto-Regular.ttf") # Assuming font file is present
+    QFontDatabase.addApplicationFont("Roboto-Bold.ttf")
+    QFontDatabase.addApplicationFont("Roboto-Italic.ttf")
     
-    app.setQuitOnLastWindowClosed(False)
-    
-    window = ClientUI()
-    window.tray_icon.showMessage(
-        "SuperFastLTM Client",
-        "Application is running in the background. Double-click the tray icon to show the home page window.",
-        QSystemTrayIcon.Information,
-        3000
-    )
+    client_ui = ClientUI()
     sys.exit(app.exec_())
+
+
