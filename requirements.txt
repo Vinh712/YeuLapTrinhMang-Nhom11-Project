@@ -6,3 +6,4 @@ keyboard==0.13.5
 google-generativeai==0.3.2
 PyQt5==5.15.10
 python-dotenv==1.0.0
+qasync
